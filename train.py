@@ -3,9 +3,20 @@ os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
 import jax
 from utils.models import get_model_ready
 from utils.helpers import load_config, save_pkl_object
+import wandb
+
 
 
 def main(config, mle_log, log_ext=""):
+    wandb.init(
+        project="gymnax-blines",
+        entity="kqg",
+        config=config,
+        name="dhvl"
+    )
+
+
+
     """Run training with ES or PPO. Store logs and agent ckpt."""
     rng = jax.random.PRNGKey(config.seed_id)
     # Setup the model architecture
@@ -36,7 +47,7 @@ def main(config, mle_log, log_ext=""):
         data_to_store,
         f"agents/{config.env_name}/{config.train_type.lower()}{log_ext}.pkl",
     )
-
+    wandb.finish()
 
 if __name__ == "__main__":
     # Use MLE-Infrastructure if available (e.g. for parameter search)
