@@ -21,6 +21,8 @@ train_config:
   lr_begin: 5e-04  # Start PPO learning rate
   lr_end: 5e-04 #  End PPO learning rate
   lr_warmup: 0.05 # Prop epochs until warmup is completed 
+  actor_epoch_ppo: 4  # "Number of PPO epochs on a single batch"
+  value_epoch_ppo: 1  # "Number of PPO epochs on a single batch"
   epoch_ppo: 4  # "Number of PPO epochs on a single batch"
   clip_eps: 0.2 # "Clipping range"
   gae_lambda: 0.95 # "GAE lambda"

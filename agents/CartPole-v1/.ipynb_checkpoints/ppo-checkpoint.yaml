@@ -1,4 +1,6 @@
 train_config:
+  tau: 0.3
+  algo: "dhvl"
   train_type: "PPO"
   num_train_steps: 150000
   evaluate_every_epochs: 1000
@@ -16,15 +18,13 @@ train_config:
   lr_begin: 5e-04  # Start PPO learning rate
   lr_end: 5e-04 #  End PPO learning rate
   lr_warmup: 0.05 # Prop epochs until warmup is completed 
-  epoch_ppo: 1  # "Number of PPO epochs on a single batch"
+  epoch_ppo: 4  # "Number of PPO epochs on a single batch"
   clip_eps: 0.2 # "Clipping range"
   gae_lambda: 0.95 # "GAE lambda"
   entropy_coeff: 0.01 # "Entropy loss coefficient"
   critic_coeff: 0.5  # "Value loss coefficient"
-  tau: 0.2
+  tau: 0.5
   seed_id: 0
-  algo: "dhvl"
-
   network_name: "Categorical-MLP"
   network_config:
     num_hidden_units: 64

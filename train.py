@@ -9,19 +9,14 @@ import wandb
 
 def main(config, mle_log, log_ext=""):
     wandb.init(
-        project="gymnax-blines",
-        entity="kqg",
+        project="gymnax-blines-kongqg",
+        entity="kongqg574-1",
         config=config,
-        name="dhvl"
+        name=f"{config.env_name}_{config.algo}_{config.tau}_seed{config.seed_id}",
+        group=config.env_name,                 #
+        job_type=f"tau_{config.tau}",          #
+        tags=[config.algo, f"tau={config.tau}"]# 
     )
-    project="gymnax-blines-kongqg",
-    entity="kongqg574-1",
-    config=config,
-    name=f"{config.env_name}_{config.algo}_{config.tau}_seed{config.seed_id}",
-    group=config.env_name,                 #
-    job_type=f"tau_{config.tau}",          #
-    tags=[config.algo, f"tau={config.tau}"]# 
-)
 
 
 
