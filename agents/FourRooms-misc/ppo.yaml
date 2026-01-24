@@ -1,4 +1,6 @@
 train_config:
+  tau: 0.3
+  algo: "dhvl"
   train_type: "PPO"
   num_train_steps: 200000
   evaluate_every_epochs: 500

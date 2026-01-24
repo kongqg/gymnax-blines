@@ -9,11 +9,6 @@ import wandb
 
 def main(config, mle_log, log_ext=""):
     wandb.init(
-        project="gymnax-blines",
-        entity="kqg",
-        config=config,
-        name="dhvl"
-    )
     project="gymnax-blines-kongqg",
     entity="kongqg574-1",
     config=config,

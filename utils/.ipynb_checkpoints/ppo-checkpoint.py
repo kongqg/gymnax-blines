@@ -8,7 +8,6 @@ import flax
 from flax.training.train_state import TrainState
 import numpy as np
 import tqdm
-import wandb
 import gymnax
 import wandb
 
@@ -342,9 +341,6 @@ def train_ppo(rng, config, model, params, mle_log):
                 config.tau,
                 config.algo,
             )
-            log_dict = {f"train/{k}": v for k, v in metric_dict.items()}
-            log_dict["steps"] = total_steps
-            wandb.log(log_dict, step=total_steps)
 
             t_dict = {f"train/{k}": v for k, v in metric_dict.items()}
             t_dict["step"] = total_steps
@@ -372,6 +368,7 @@ def train_ppo(rng, config, model, params, mle_log):
                 )
             m_dict = {"eval/episode_return": float(rewards)}
             wandb.log(m_dict, step=total_steps)
+
 
     return (
         log_steps,
@@ -571,7 +568,6 @@ def update(
         avg_metrics_dict["value_pred"] += np.asarray(value_pred)
         avg_metrics_dict["target"] += np.asarray(target_val)
         avg_metrics_dict["gae"] += np.asarray(gae_val)
-
 
     for k, v in avg_metrics_dict.items():
         avg_metrics_dict[k] = v / (epoch_ppo)

@@ -1,4 +1,6 @@
 train_config:
+  tau: 0.3
+  algo: "dhvl"
   train_type: "PPO"
   num_train_steps: 250000
   evaluate_every_epochs: 1000
@@ -21,6 +23,7 @@ train_config:
   gae_lambda: 0.95 # "GAE lambda"
   entropy_coeff: 0.003 # "Entropy loss coefficient"
   critic_coeff: 0.5  # "Value loss coefficient"
+  tau: 0.4
 
   network_name: "Categorical-MLP"
   network_config:
