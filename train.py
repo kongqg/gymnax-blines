@@ -30,7 +30,7 @@ def main(config, mle_log, log_ext=""):
     if config.train_type == "ES":
         from utils.es import train_es as train_fn
     elif config.train_type == "PPO":
-        from utils.ppo import train_ppo as train_fn
+        from utils.ppo_algos import train_ppo as train_fn
     else:
         raise ValueError("Unknown train_type. Has to be in ('ES', 'PPO').")
 
@@ -100,10 +100,24 @@ if __name__ == "__main__":
     default=None,   # 不传就用 yaml 里的 tau
     help="Tau parameter (override config train_config.tau).",
 )
+    parser.add_argument(
+        "--value_update_iter",
+        type=int,
+        default=None,   # 不传就用 yaml 里的 tau
+        help="value_update_iter",
+    )
+    parser.add_argument(
+        "--actor_update_iter",
+        type=int,
+        default=None,   # 不传就用 yaml 里的 tau
+        help="actor_update_iter",
+    )
     args, _ = parser.parse_known_args()
     config = load_config(args.config_fname, args.seed_id, args.lrate)
 
     config.train_config.algo = args.algo
+    config.train_config.value_update_iter = args.value_update_iter
+    config.train_config.value_update_iter = args.actor_update_iter
 
     if args.tau is not None:
         config.train_config.tau = float(args.tau)

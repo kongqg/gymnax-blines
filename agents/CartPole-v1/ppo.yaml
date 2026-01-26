@@ -1,5 +1,6 @@
 train_config:
-  tau: 0.3
+  actor_update_iter: 4
+  value_update_iter: 4
   algo: "dhvl"
   train_type: "PPO"
   num_train_steps: 150000

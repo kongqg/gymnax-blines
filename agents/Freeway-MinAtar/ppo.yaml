@@ -1,4 +1,6 @@
 train_config:
+  actor_update_iter: 1
+  value_update_iter: 4
   tau: 0.3
   algo: "dhvl"
   train_type: "PPO"
@@ -19,6 +21,8 @@ train_config:
   lr_end: 5e-04 #  End PPO learning rate
   lr_warmup: 0.05 # Prop epochs until warmup is completed 
   epoch_ppo: 4  # "Number of PPO epochs on a single batch"
+  value_epoch_ppo: 4
+  actor_epoch_ppo: 4
   clip_eps: 0.2 # "Clipping range"
   gae_lambda: 0.95 # "GAE lambda"
   entropy_coeff: 0.01 # "Entropy loss coefficient"

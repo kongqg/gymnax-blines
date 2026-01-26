@@ -1,12 +1,14 @@
 train_config:
-  tau: 0.3
+  actor_update_iter: 1
+  value_update_iter: 4
+  tau: 0.6
   algo: "dhvl"
   train_type: "PPO"
-  num_train_steps: 150000
+  num_train_steps: 300000
   evaluate_every_epochs: 1000
 
   env_name: "DeepSea-bsuite"
-  env_kwargs: {}
+  env_kwargs: {size: 10}
   env_params: {}
   num_test_rollouts: 164
   
