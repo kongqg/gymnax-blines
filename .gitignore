@@ -1,2 +1,23 @@
-output/
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# env / notebook
+.env
+.venv/
+.ipynb_checkpoints/
+
+# logs / runs
 wandb/
+runs/
+logs/
+checkpoints/
+outputs/
+
+# system
+.DS_Store
