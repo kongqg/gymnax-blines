@@ -599,7 +599,7 @@ def update(
             flat_obs = flatten_dims(obs_eval)  # [B*T, ...]
             flat_act = flatten_dims(action_eval)  # [B*T, ...]
             _, pi = policy(train_state.apply_fn, train_state.params, flat_obs, rng=None)
-            flat_logp = pi.log_prob(flat_act[..., -1])
+            flat_logp = pi.log_prob(flat_act)
             T, B = obs_eval.shape[0], obs_eval.shape[1]
             current_log_pis = flat_logp.reshape(B, T).swapaxes(0, 1)  # [T,B]
             current_batch = batch_manager.get(buffer_dict, current_log_pis)
