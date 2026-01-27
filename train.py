@@ -117,7 +117,7 @@ if __name__ == "__main__":
 
     config.train_config.algo = args.algo
     config.train_config.value_update_iter = args.value_update_iter
-    config.train_config.value_update_iter = args.actor_update_iter
+    config.train_config.actor_update_iter = args.actor_update_iter
 
     if args.tau is not None:
         config.train_config.tau = float(args.tau)
