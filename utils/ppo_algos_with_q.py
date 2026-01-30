@@ -1,0 +1,871 @@
+from functools import partial
+import optax
+import jax
+import jax.numpy as jnp
+from typing import Any, Callable, Tuple
+from collections import defaultdict
+import flax
+from flax.training.train_state import TrainState
+import numpy as np
+import tqdm
+import gymnax
+import wandb
+
+
+class BatchManager:
+    def __init__(
+            self,
+            discount: float,
+            gae_lambda: float,
+            n_steps: int,
+            num_envs: int,
+            action_size,
+            state_space,
+            tau: float,
+            algo,
+            lam_q,
+    ):
+        self.num_envs = num_envs
+        self.action_size = action_size
+        self.buffer_size = num_envs * n_steps
+        self.num_envs = num_envs
+        self.n_steps = n_steps
+        self.discount = discount
+        self.gae_lambda = gae_lambda
+        self.tau = tau
+        self.algo = algo
+        self.lam_q = lam_q
+
+        try:
+            temp = state_space.shape[0]
+            self.state_shape = state_space.shape
+        except Exception:
+            self.state_shape = [state_space]
+        self.reset()
+
+    @partial(jax.jit, static_argnums=0)
+    def reset(self):
+        if self.algo == "dhvl-q":
+            return {
+                "states": jnp.empty(
+                    (self.n_steps, self.num_envs, *self.state_shape),
+                    dtype=jnp.float32,
+                ),
+                "actions": jnp.empty(
+                    (self.n_steps, self.num_envs, *self.action_size),
+                ),
+                "rewards": jnp.empty(
+                    (self.n_steps, self.num_envs), dtype=jnp.float32
+                ),
+                "dones": jnp.empty((self.n_steps, self.num_envs), dtype=jnp.uint8),
+                "log_pis_old": jnp.empty(
+                    (self.n_steps, self.num_envs), dtype=jnp.float32
+                ),
+                "values_old": jnp.empty(
+                    (self.n_steps, self.num_envs), dtype=jnp.float32
+                ),
+                "q_values_old": jnp.empty(
+                    (self.n_steps, self.num_envs), dtype=jnp.float32
+                ),
+                "_p": 0,
+            }
+        else:
+            return {
+                "states": jnp.empty(
+                    (self.n_steps, self.num_envs, *self.state_shape),
+                    dtype=jnp.float32,
+                ),
+                "actions": jnp.empty(
+                    (self.n_steps, self.num_envs, *self.action_size),
+                ),
+                "rewards": jnp.empty(
+                    (self.n_steps, self.num_envs), dtype=jnp.float32
+                ),
+                "dones": jnp.empty((self.n_steps, self.num_envs), dtype=jnp.uint8),
+                "log_pis_old": jnp.empty(
+                    (self.n_steps, self.num_envs), dtype=jnp.float32
+                ),
+                "values_old": jnp.empty(
+                    (self.n_steps, self.num_envs), dtype=jnp.float32
+                ),
+                "_p": 0,
+            }
+
+    @partial(jax.jit, static_argnums=0)
+    def append(self, buffer, state, action, reward, done, log_pi, value, q_value = None):
+        if self.algo == "dhvl-q":
+            return {
+                "states": buffer["states"].at[buffer["_p"]].set(state),
+                "actions": buffer["actions"].at[buffer["_p"]].set(action),
+                "rewards": buffer["rewards"].at[buffer["_p"]].set(reward.squeeze()),
+                "dones": buffer["dones"].at[buffer["_p"]].set(done.squeeze()),
+                "log_pis_old": buffer["log_pis_old"].at[buffer["_p"]].set(log_pi),
+                "values_old": buffer["values_old"].at[buffer["_p"]].set(value),
+                "q_values_old": buffer["q_values_old"].at[buffer["_p"]].set(q_value),
+                "_p": (buffer["_p"] + 1) % self.n_steps,
+            }
+        else:
+            return {
+                "states": buffer["states"].at[buffer["_p"]].set(state),
+                "actions": buffer["actions"].at[buffer["_p"]].set(action),
+                "rewards": buffer["rewards"].at[buffer["_p"]].set(reward.squeeze()),
+                "dones": buffer["dones"].at[buffer["_p"]].set(done.squeeze()),
+                "log_pis_old": buffer["log_pis_old"].at[buffer["_p"]].set(log_pi),
+                "values_old": buffer["values_old"].at[buffer["_p"]].set(value),
+                "_p": (buffer["_p"] + 1) % self.n_steps,
+            }
+
+    @partial(jax.jit, static_argnums=0)
+    def get(self, buffer, current_log_pi = None):
+        if self.algo == "dhvl-q":
+            lam_v = self.gae_lambda / self.lam_q / self.tau
+            gae, target, adjusted_q = self._compute_expectile_gae_with_q(
+                values=buffer["values_old"],
+                rewards=buffer["rewards"],
+                discounts=buffer["dones"],
+                q_values=buffer["q_values_old"],
+                tau=self.tau,
+                lam_q=self.lam_q,
+                lam_v=lam_v,
+            )
+            batch = (
+                buffer["states"][:-1],
+                buffer["actions"][:-1],
+                buffer["log_pis_old"][:-1],
+                buffer["values_old"][:-1],
+                buffer["q_values_old"][:-1],
+                target,
+                gae,
+            )
+        else:
+            if self.algo == "ppo":
+                gae, target = self.calculate_gae(
+                    value=buffer["values_old"],
+                    reward=buffer["rewards"],
+                    done=buffer["dones"],
+                )
+            elif self.algo == "dhvl":
+                gae, target = self.calculate_expectile_gae(
+                    value=buffer["values_old"],
+                    reward=buffer["rewards"],
+                    done=buffer["dones"],
+                )
+            elif self.algo == "ppo-vtrace":
+                # first rollout
+                if current_log_pi is None:
+                    current_log_pi = buffer["log_pis_old"]
+                gae, target = self.calculate_vtrace(
+                    value=buffer["values_old"],
+                    reward=buffer["rewards"],
+                    done=buffer["dones"],
+                    log_pi_old=buffer["log_pis_old"],
+                    current_log_pi=current_log_pi,
+                )
+
+            batch = (
+                buffer["states"][:-1],
+                buffer["actions"][:-1],
+                buffer["log_pis_old"][:-1],
+                buffer["values_old"][:-1],
+                target,
+                gae,
+            )
+        return batch
+
+    @partial(jax.jit, static_argnums=0)
+    def calculate_expectile_gae(
+            self, value: jnp.ndarray, reward: jnp.ndarray, done: jnp.ndarray
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+
+        v_all = value.astype(jnp.float32)  # [T+1,B]
+        T = v_all.shape[0] - 1
+
+        v_old = v_all[:T]  # V_t     [T,B]
+        v_tp1 = v_all[1:T + 1]  # V_{t+1} [T,B]
+        last_value = v_all[-1]  # V_T     [B]
+
+        r = reward.astype(jnp.float32)[:T]  # r_t [T,B]
+
+        d = (1.0 - done.astype(jnp.float32))[:T]  # [T,B]
+
+        def step(G_next, xs):
+            r_t, d_t, v_tp1_t = xs  # each [B]
+            u = G_next - v_tp1_t
+            pos = jnp.maximum(u, 0.0)  # (u)_+
+            neg = jnp.maximum(-u, 0.0)  # (u)_-
+            lam = self.gae_lambda / self.tau
+            soft = v_tp1_t + lam * (self.tau * pos - (1.0 - self.tau) * neg)
+            G_t = r_t + self.discount * d_t * soft
+            return G_t, G_t
+
+        _, G_rev = jax.lax.scan(
+            step,
+            last_value,
+            (r[::-1], d[::-1], v_tp1[::-1]),
+        )
+
+        returns = G_rev[::-1]  # [T,B]
+        adv = jax.lax.stop_gradient(returns - v_old)
+        return adv, returns
+
+    @partial(jax.jit, static_argnums=0)
+    def calculate_gae(
+            self, value: jnp.ndarray, reward: jnp.ndarray, done: jnp.ndarray
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        advantages = []
+        gae = 0.0
+        for t in reversed(range(len(reward) - 1)):
+            value_diff = self.discount * value[t + 1] * (1 - done[t]) - value[t]
+            delta = reward[t] + value_diff
+            gae = delta + self.discount * self.gae_lambda * (1 - done[t]) * gae
+            advantages.append(gae)
+        advantages = advantages[::-1]
+        advantages = jnp.array(advantages)
+        return advantages, advantages + value[:-1]
+
+    @partial(jax.jit, static_argnums=0)
+    def calculate_vtrace(self, value, reward, done, log_pi_old, current_log_pi):
+        T = value.shape[0] - 1
+        v_tm1 = value[:T]
+        v_t = value[1:T+1]
+        r_t = reward[:T]
+        discount_t = self.discount * (1.0 - done[:T])
+        current_log_pi = current_log_pi[:T]
+        log_pi_old_t = log_pi_old[:T]
+
+        rho_t = jnp.exp(current_log_pi - log_pi_old_t)
+
+        rho_bar = 1.0
+        c_bar = 1.0
+
+        clipped_rho = jnp.minimum(rho_bar, rho_t)
+        c_tm1 = jnp.minimum(c_bar, rho_t) * self.gae_lambda
+
+        td_errors = clipped_rho * (r_t + discount_t * v_t - v_tm1)
+
+        def _body(acc, xs):
+            td_error, discount, c = xs
+            acc = td_error + discount * c * acc
+            return acc, acc
+
+        _, errors = jax.lax.scan(
+            _body,
+            jnp.zeros_like(value[-1]),
+            (td_errors[::-1], discount_t[::-1], c_tm1[::-1]),
+            reverse=False
+        )
+
+        # reverse 回来
+        errors = errors[::-1]
+
+        v_trace_target = jax.lax.stop_gradient(errors + v_tm1)
+        advantages = jax.lax.stop_gradient(v_trace_target - v_tm1)
+
+        return advantages, v_trace_target
+
+    def _compute_expectile_gae_with_q(
+            self,
+            rewards: jnp.ndarray,  # [T,B]
+            discounts: jnp.ndarray,  # [T,B]  done 0, else 1
+            values: jnp.ndarray,  # [T,B]
+            q_values: jnp.ndarray,  # [T,B]    from delayed
+            lam_v: float,
+            lam_q: float,  #
+            tau: float,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+
+          return advantage hat{Q} - V, returns (hat{Q} target for Q(s,a) )
+        """
+        done = (1.0 - discounts)
+        last_value = values[-1]  # [B]
+        T = values.shape[0] - 1  # number of transitions
+        v_t = values[:T]  # [T, B]   V(s_t)
+        def step(carry, xs):
+            q_value_t, value_t, done_t, reward_t = xs  # each [B]
+
+            q_estimate_t = reward_t + self.discount * done_t * carry
+            adjusted_q = (1 - lam_q) * q_value_t + lam_q * q_estimate_t
+
+            delta_v = adjusted_q - value_t
+            adjusted_v = value_t + lam_v * jnp.where(delta_v > 0, tau * delta_v, (1 - tau) * delta_v)
+            return adjusted_v, (q_estimate_t, adjusted_q)
+
+        _, (returns_rev, adjusted_q) = jax.lax.scan(
+            step,
+            (last_value),
+            (q_values[::-1], values[::-1], done[::-1], rewards[::-1]),
+        )
+
+        returns = returns_rev[::-1]
+        adjusted_q = adjusted_q[::-1]
+        advantage = adjusted_q - v_t
+        return advantage, returns, adjusted_q
+
+
+class RolloutManager(object):
+    def __init__(self, model, env_name, algo, env_kwargs, env_params):
+        # Setup functionalities for vectorized batch rollout
+        self.env_name = env_name
+        self.env, self.env_params = gymnax.make(env_name, **env_kwargs)
+        self.env_params = self.env_params.replace(**env_params)
+        self.observation_space = self.env.observation_space(self.env_params)
+        self.action_size = self.env.action_space(self.env_params).shape
+        self.apply_fn = model.apply
+        self.select_action = self.select_action_ppo
+        self.algo = algo
+
+    @partial(jax.jit, static_argnums=0)
+    def select_action_ppo(
+            self,
+            train_state: TrainState,
+            obs: jnp.ndarray,
+            rng: jax.random.PRNGKey,
+    ):
+        if self.algo == "dhvl-q":
+            value, pi, q = policy(train_state.apply_fn, train_state.params, obs, rng, self.algo)
+            action = pi.sample(seed=rng)
+            log_prob = pi.log_prob(action)
+            return action, log_prob, value[:, 0], rng, q[:, 0]
+        else:
+            value, pi = policy(train_state.apply_fn, train_state.params, obs, rng, self.algo)
+            action = pi.sample(seed=rng)
+            log_prob = pi.log_prob(action)
+            return action, log_prob, value[:, 0], rng
+
+    @partial(jax.jit, static_argnums=0)
+    def batch_reset(self, keys):
+        return jax.vmap(self.env.reset, in_axes=(0, None))(
+            keys, self.env_params
+        )
+
+    @partial(jax.jit, static_argnums=0)
+    def batch_step(self, keys, state, action):
+        return jax.vmap(self.env.step, in_axes=(0, 0, 0, None))(
+            keys, state, action, self.env_params
+        )
+
+    @partial(jax.jit, static_argnums=(0, 3))
+    def batch_evaluate(self, rng_input, train_state, num_envs):
+        """Rollout an episode with lax.scan."""
+        # Reset the environment
+        rng_reset, rng_episode = jax.random.split(rng_input)
+        obs, state = self.batch_reset(jax.random.split(rng_reset, num_envs))
+
+        def policy_step(state_input, _):
+            """lax.scan compatible step transition in jax env."""
+            obs, state, train_state, rng, cum_reward, valid_mask = state_input
+            rng, rng_step, rng_net = jax.random.split(rng, 3)
+            if self.algo == "dhvl-q":
+                action, _, _, rng, _ = self.select_action(train_state, obs, rng_net)
+            else:
+                action, _, _, rng = self.select_action(train_state, obs, rng_net)
+            next_o, next_s, reward, done, _ = self.batch_step(
+                jax.random.split(rng_step, num_envs),
+                state,
+                action.squeeze(),
+            )
+            new_cum_reward = cum_reward + reward * valid_mask
+            new_valid_mask = valid_mask * (1 - done)
+            carry, y = [
+                next_o,
+                next_s,
+                train_state,
+                rng,
+                new_cum_reward,
+                new_valid_mask,
+            ], [new_valid_mask]
+            return carry, y
+
+        # Scan over episode step loop
+        carry_out, scan_out = jax.lax.scan(
+            policy_step,
+            [
+                obs,
+                state,
+                train_state,
+                rng_episode,
+                jnp.array(num_envs * [0.0]),
+                jnp.array(num_envs * [1.0]),
+            ],
+            (),
+            self.env_params.max_steps_in_episode,
+        )
+
+        cum_return = carry_out[-2].squeeze()
+        return jnp.mean(cum_return)
+
+
+@partial(jax.jit, static_argnames=("apply_fn", "algo"))
+def policy(
+        apply_fn: Callable[..., Any],
+        params: flax.core.frozen_dict.FrozenDict,
+        obs: jnp.ndarray,
+        rng,
+        algo,
+):
+    if algo == "dhvl-q":
+        value, pi, q = apply_fn(params, obs, rng)
+        return value, pi, q
+    else:
+        value, pi = apply_fn(params, obs, rng)
+        return value, pi
+
+
+def train_ppo(rng, config, model, params, mle_log):
+    """Training loop for PPO based on https://github.com/bmazoure/ppo_jax."""
+    num_total_epochs = int(config.num_train_steps // config.num_train_envs + 1)
+    num_steps_warm_up = int(config.num_train_steps * config.lr_warmup)
+    schedule_fn = optax.linear_schedule(
+        init_value=-float(config.lr_begin),
+        end_value=-float(config.lr_end),
+        transition_steps=num_steps_warm_up,
+    )
+
+    tx = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.scale_by_adam(eps=1e-5),
+        optax.scale_by_schedule(schedule_fn),
+    )
+
+    train_state = TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+    )
+    # Setup the rollout manager -> Collects data in vmapped-fashion over envs
+    rollout_manager = RolloutManager(
+        model, config.env_name, config.algo, config.env_kwargs, config.env_params
+    )
+
+    batch_manager = BatchManager(
+        discount=config.gamma,
+        gae_lambda=config.gae_lambda,
+        n_steps=config.n_steps + 1,
+        num_envs=config.num_train_envs,
+        action_size=rollout_manager.action_size,
+        state_space=rollout_manager.observation_space,
+        tau=config.tau,
+        algo=config.algo,
+        lam_q=config.lam_q,
+    )
+
+    @partial(jax.jit, static_argnums=5)
+    def get_transition(
+            train_state: TrainState,
+            obs: jnp.ndarray,
+            state: dict,
+            batch,
+            rng: jax.random.PRNGKey,
+            num_train_envs: int,
+    ):
+        if config.algo == "dhvl-q":
+            action, log_pi, value, new_key, q = rollout_manager.select_action(
+                train_state, obs, rng
+            )
+        else:
+            action, log_pi, value, new_key = rollout_manager.select_action(
+                train_state, obs, rng
+            )
+        # print(action.shape)
+        new_key, key_step = jax.random.split(new_key)
+        b_rng = jax.random.split(key_step, num_train_envs)
+        # Automatic env resetting in gymnax step!
+        next_obs, next_state, reward, done, _ = rollout_manager.batch_step(
+            b_rng, state, action
+        )
+        if config.algo == "dhvl-q":
+            batch = batch_manager.append(
+                batch, obs, action, reward, done, log_pi, value, q
+            )
+        else:
+            batch = batch_manager.append(
+                batch, obs, action, reward, done, log_pi, value
+            )
+
+        return train_state, next_obs, next_state, batch, new_key
+
+    batch = batch_manager.reset()
+
+    rng, rng_step, rng_reset, rng_eval, rng_update = jax.random.split(rng, 5)
+    obs, state = rollout_manager.batch_reset(
+        jax.random.split(rng_reset, config.num_train_envs)
+    )
+
+    total_steps = 0
+    log_steps, log_return = [], []
+    t = tqdm.tqdm(range(1, num_total_epochs + 1), desc="PPO", leave=True)
+    for step in t:
+        train_state, obs, state, batch, rng_step = get_transition(
+            train_state,
+            obs,
+            state,
+            batch,
+            rng_step,
+            config.num_train_envs,
+        )
+        total_steps += config.num_train_envs
+        if step % (config.n_steps + 1) == 0:
+            metric_dict, train_state, rng_update = update(
+                train_state,
+                batch if config.algo == "ppo-vtrace" else batch_manager.get(batch),
+                config.num_train_envs,
+                config.n_steps,
+                config.n_minibatch,
+                config.epoch_ppo,
+                config.clip_eps,
+                config.entropy_coeff,
+                config.critic_coeff,
+                rng_update,
+                config.tau,
+                config.algo,
+                batch_manager if config.algo == "ppo-vtrace" else None,
+                lam_q=config.lam_q
+            )
+
+            t_dict = {f"train/{k}": v for k, v in metric_dict.items()}
+            t_dict["step"] = total_steps
+            wandb.log(t_dict, step=total_steps)
+            batch = batch_manager.reset()
+
+        if (step + 1) % config.evaluate_every_epochs == 0:
+            rng, rng_eval = jax.random.split(rng)
+            rewards = rollout_manager.batch_evaluate(
+                rng_eval,
+                train_state,
+                config.num_test_rollouts,
+            )
+            log_steps.append(total_steps)
+            log_return.append(rewards)
+            t.set_description(f"R: {str(rewards)}")
+            t.refresh()
+
+            if mle_log is not None:
+                mle_log.update(
+                    {"num_steps": total_steps},
+                    {"return": rewards},
+                    model=train_state.params,
+                    save=True,
+                )
+            m_dict = {"eval/episode_return": float(rewards)}
+            wandb.log(m_dict, step=total_steps)
+
+    return (
+        log_steps,
+        log_return,
+        train_state.params,
+    )
+
+
+@jax.jit
+def flatten_dims(x):
+    return x.swapaxes(0, 1).reshape(x.shape[0] * x.shape[1], *x.shape[2:])
+
+
+def expectile_actor_loss_helper(tau, adv):
+    weight = jnp.where(adv > 0, 2.0 * tau, 2.0 * (1.0 - tau))
+    return weight
+
+
+def expectile_value_loss_helper(target, value, value_clipped, tau):
+    delta1 = target - value
+    delta2 = target - value_clipped
+
+    w1 = jnp.where(delta1 > 0, 2.0 * tau, 2.0 * (1.0 - tau))
+    w2 = jnp.where(delta2 > 0, 2.0 * tau, 2.0 * (1.0 - tau))
+
+    return w1, w2
+
+
+def loss_actor_and_critic_expectile(
+        params_model: flax.core.frozen_dict.FrozenDict,
+        apply_fn: Callable[..., Any],
+        obs: jnp.ndarray,
+        target_v: jnp.ndarray,
+        target_q: jnp.ndarray,
+        value_old: jnp.ndarray,
+        log_pi_old: jnp.ndarray,
+        gae: jnp.ndarray,
+        action: jnp.ndarray,
+        clip_eps: float,
+        critic_coeff: float,
+        entropy_coeff: float,
+        tau: float,
+        algo: str,
+) -> jnp.ndarray:
+    if algo == "dhvl-q":
+        value_pred, pi, q_pred = apply_fn(params_model, obs, rng=None)
+        value_pred = value_pred[:, 0]
+        q_pred = q_pred[:, 0]
+        # q_loss
+        q_loss = (0.5 * jnp.square(q_pred - jax.lax.stop_gradient(target_q))).mean()
+        # value loss
+        value_pred_clipped = value_old + (value_pred - value_old).clip(
+            -clip_eps, clip_eps
+        )
+        value_losses = jnp.square(target_v - value_pred)
+        value_losses_clipped = jnp.square(value_pred_clipped - target_v)
+        w1, w2 = expectile_value_loss_helper(target_v, value_pred, value_pred_clipped, tau)
+        value_loss = 0.5 * jnp.maximum(w1 * value_losses, w2 * value_losses_clipped).mean()
+    elif algo == "dhvl":
+        # value loss
+        value_pred, pi = apply_fn(params_model, obs, rng=None)
+        value_pred = value_pred[:, 0]
+        value_pred_clipped = value_old + (value_pred - value_old).clip(
+            -clip_eps, clip_eps
+        )
+        value_losses = jnp.square(value_pred - target_v)
+        value_losses_clipped = jnp.square(value_pred_clipped - target_v)
+        w1, w2 = expectile_value_loss_helper(target_v, value_pred, value_pred_clipped, tau)
+        value_loss = 0.5 * jnp.maximum(w1 * value_losses, w2 * value_losses_clipped).mean()
+        q_loss = 0.0
+    # q_value loss
+
+    # TODO: Figure out why training without 0 breaks categorical model
+    # And why with 0 breaks gaussian model pi
+    log_prob = pi.log_prob(action[..., -1])
+    ratio = jnp.exp(log_prob - log_pi_old)
+    gae_mean = gae.mean()
+    gae = (gae - gae_mean) / (gae.std() + 1e-8)
+    loss_actor1 = ratio * gae
+    loss_actor2 = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * gae
+
+    actor_weight = expectile_actor_loss_helper(tau, gae)
+
+    loss_actor = -jnp.minimum(actor_weight * loss_actor1, actor_weight * loss_actor2)
+    loss_actor = loss_actor.mean()
+
+    entropy = pi.entropy().mean()
+
+    total_loss = (
+            loss_actor + critic_coeff * value_loss - entropy_coeff * entropy + q_loss
+    )
+
+    return total_loss, (
+        value_loss,
+        loss_actor,
+        q_loss,
+        entropy,
+        value_pred.mean(),
+        target_v.mean(),
+        target_q.mean(),
+        gae_mean,
+    )
+
+
+def loss_actor_and_critic(
+        params_model: flax.core.frozen_dict.FrozenDict,
+        apply_fn: Callable[..., Any],
+        obs: jnp.ndarray,
+        target: jnp.ndarray,
+        value_old: jnp.ndarray,
+        log_pi_old: jnp.ndarray,
+        gae: jnp.ndarray,
+        action: jnp.ndarray,
+        clip_eps: float,
+        critic_coeff: float,
+        entropy_coeff: float,
+) -> jnp.ndarray:
+    value_pred, pi = apply_fn(params_model, obs, rng=None)
+    value_pred = value_pred[:, 0]
+
+    # TODO: Figure out why training without 0 breaks categorical model
+    # And why with 0 breaks gaussian model pi
+    log_prob = pi.log_prob(action[..., -1])
+
+    value_pred_clipped = value_old + (value_pred - value_old).clip(
+        -clip_eps, clip_eps
+    )
+    value_losses = jnp.square(value_pred - target)
+    value_losses_clipped = jnp.square(value_pred_clipped - target)
+    value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+
+    ratio = jnp.exp(log_prob - log_pi_old)
+    gae_mean = gae.mean()
+    gae = (gae - gae_mean) / (gae.std() + 1e-8)
+    loss_actor1 = ratio * gae
+    loss_actor2 = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * gae
+    loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
+    loss_actor = loss_actor.mean()
+
+    entropy = pi.entropy().mean()
+
+    total_loss = (
+            loss_actor + critic_coeff * value_loss - entropy_coeff * entropy
+    )
+
+    return total_loss, (
+        value_loss,
+        loss_actor,
+        entropy,
+        value_pred.mean(),
+        target.mean(),
+        gae_mean,
+    )
+
+
+def update(
+        train_state: TrainState,
+        batch,
+        num_envs: int,
+        n_steps: int,
+        n_minibatch: int,
+        epoch_ppo: int,
+        clip_eps: float,
+        entropy_coeff: float,
+        critic_coeff: float,
+        rng: jax.random.PRNGKey,
+        tau: float,
+        algo,
+        batch_manager,
+        lam_q,
+):
+    """Perform multiple epochs of updates with multiple updates."""
+    if algo == "ppo-vtrace":
+        current_batch = batch_manager.get(batch)
+        buffer_dict = batch
+    elif algo == "dhvl-q":
+        obs, action, log_pi_old, value, q_value, target, gae = batch
+    else:
+        current_batch = batch
+        buffer_dict = None
+        obs, action, log_pi_old, value, target, gae = batch
+    size_batch = num_envs * n_steps
+    size_minibatch = size_batch // n_minibatch
+    idxes = jnp.arange(num_envs * n_steps)
+    avg_metrics_dict = defaultdict(int)
+
+
+
+    for _ in range(epoch_ppo):
+        idxes = jax.random.permutation(rng, idxes)
+        idxes_list = [
+            idxes[start: start + size_minibatch]
+            for start in jnp.arange(0, size_batch, size_minibatch)
+        ]
+        if algo == "ppo-vtrace":
+            obs_eval, action_eval, _, _, _, _ = current_batch
+            flat_obs = flatten_dims(obs_eval)  # [B*T, ...]
+            flat_act = flatten_dims(action_eval)  # [B*T, ...]
+            _, pi = policy(train_state.apply_fn, train_state.params, flat_obs, rng=None, algo=algo)
+            flat_logp = pi.log_prob(flat_act)
+            T, B = obs_eval.shape[0], obs_eval.shape[1]
+            current_log_pis = flat_logp.reshape(B, T).swapaxes(0, 1)  # [T,B]
+            current_batch = batch_manager.get(buffer_dict, current_log_pis)
+            obs, action, log_pi_old, value, target, gae = current_batch
+        idxes = jax.random.permutation(rng, idxes)
+        idxes_2d = idxes.reshape((n_minibatch, size_minibatch))
+        train_state, total_loss = update_epoch(
+            train_state,
+            idxes_2d,
+            flatten_dims(obs),
+            flatten_dims(action),
+            flatten_dims(log_pi_old),
+            flatten_dims(value),
+            jnp.array(flatten_dims(target)),
+            jnp.array(flatten_dims(gae)),
+            clip_eps,
+            entropy_coeff,
+            critic_coeff,
+            tau,
+            algo,
+            lam_q,
+        )
+
+        total_loss, (
+            value_loss,
+            loss_actor,
+            entropy,
+            value_pred,
+            target_val,
+            gae_val,
+        ) = total_loss
+
+        avg_metrics_dict["total_loss"] += np.asarray(total_loss)
+        avg_metrics_dict["value_loss"] += np.asarray(value_loss)
+        avg_metrics_dict["actor_loss"] += np.asarray(loss_actor)
+        avg_metrics_dict["entropy"] += np.asarray(entropy)
+        avg_metrics_dict["value_pred"] += np.asarray(value_pred)
+        avg_metrics_dict["target"] += np.asarray(target_val)
+        avg_metrics_dict["gae"] += np.asarray(gae_val)
+
+    for k, v in avg_metrics_dict.items():
+        avg_metrics_dict[k] = v / (epoch_ppo)
+
+    return avg_metrics_dict, train_state, rng
+
+
+@partial(jax.jit, static_argnames=("algo",))
+def update_epoch(
+        train_state: TrainState,
+        idxes: jnp.ndarray,
+        obs,
+        action,
+        log_pi_old,
+        value,
+        target,
+        gae,
+        clip_eps: float,
+        entropy_coeff: float,
+        critic_coeff: float,
+        tau: float,
+        algo: str,
+        lam_q: float
+):
+    for idx in idxes:
+        # print(action[idx].shape, action[idx].reshape(-1, 1).shape)
+        if algo == "ppo":
+            grad_fn = jax.value_and_grad(loss_actor_and_critic, has_aux=True)
+            total_loss, grads = grad_fn(
+                train_state.params,
+                train_state.apply_fn,
+                obs=obs[idx],
+                target=target[idx],
+                value_old=value[idx],
+                log_pi_old=log_pi_old[idx],
+                gae=gae[idx],
+                # action=action[idx].reshape(-1, 1),
+                action=jnp.expand_dims(action[idx], -1),
+                clip_eps=clip_eps,
+                critic_coeff=critic_coeff,
+                entropy_coeff=entropy_coeff,
+            )
+        elif algo == "dhvl" or algo == "dhvl-q":
+            grad_fn = jax.value_and_grad(loss_actor_and_critic_expectile, has_aux=True)
+            total_loss, grads = grad_fn(
+                train_state.params,
+                train_state.apply_fn,
+                obs=obs[idx],
+                target=target[idx],
+                value_old=value[idx],
+                log_pi_old=log_pi_old[idx],
+                gae=gae[idx],
+                # action=action[idx].reshape(-1, 1),
+                action=jnp.expand_dims(action[idx], -1),
+                clip_eps=clip_eps,
+                critic_coeff=critic_coeff,
+                entropy_coeff=entropy_coeff,
+                tau=tau,
+                algo=algo,
+            )
+        elif algo == "ppo-vtrace":
+            grad_fn = jax.value_and_grad(loss_actor_and_critic, has_aux=True)
+            total_loss, grads = grad_fn(
+                train_state.params,
+                train_state.apply_fn,
+                obs=obs[idx],
+                target=target[idx],
+                value_old=value[idx],
+                log_pi_old=log_pi_old[idx],
+                gae=gae[idx],
+                # action=action[idx].reshape(-1, 1),
+                action=jnp.expand_dims(action[idx], -1),
+                clip_eps=clip_eps,
+                critic_coeff=critic_coeff,
+                entropy_coeff=entropy_coeff,
+            )
+        else:
+            raise ValueError(f"unknown the algo:{algo}")
+
+        train_state = train_state.apply_gradients(grads=grads)
+    return train_state, total_loss

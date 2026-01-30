@@ -1,5 +1,5 @@
 gymnax
-evosax
+evosax==0.1.5
 optax
 dotmap
 tqdm

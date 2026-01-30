@@ -19,11 +19,11 @@ def get_model_ready(rng, config, speed=False):
     elif config.train_type == "PPO":
         if config.network_name == "Categorical-MLP":
             model = CategoricalSeparateMLP(
-                **config.network_config, num_output_units=env.num_actions
+                **config.network_config, num_output_units=env.num_actions, algo = config.train_config.algo
             )
         elif config.network_name == "Gaussian-MLP":
             model = GaussianSeparateMLP(
-                **config.network_config, num_output_units=env.num_actions
+                **config.network_config, num_output_units=env.num_actions, algo = config.train_config.algo
             )
 
     # Only use feedforward MLP in speed evaluations!
@@ -64,6 +64,7 @@ class CategoricalSeparateMLP(nn.Module):
     model_name: str = "separate-mlp"
     flatten_2d: bool = False  # Catch case
     flatten_3d: bool = False  # Rooms/minatar case
+    algo: str = "dhvl"
 
     @nn.compact
     def __call__(self, x, rng):
@@ -101,6 +102,30 @@ class CategoricalSeparateMLP(nn.Module):
             name=self.prefix_critic + "_fc_v",
             bias_init=default_mlp_init(),
         )(x_v)
+        if self.algo == "dhvl-q":
+
+            x_q = nn.relu(
+                nn.Dense(
+                    self.num_hidden_units,
+                        name= "critic_Q_fc_1",
+                    bias_init=default_mlp_init(),
+                )(x)
+            )
+    
+            for i in range(1, self.num_hidden_layers):
+                x_q = nn.relu(
+                    nn.Dense(
+                        self.num_hidden_units,
+                        name= f"critic_Q_fc_{i+1}",
+                        bias_init=default_mlp_init(),
+                    )
+                (x_q)
+            )
+            q = nn.Dense(
+                1,
+                name = "critic_Q" + "_fc_q",
+                bias_init=default_mlp_init(),
+            )(x_q)
 
         x_a = nn.relu(
             nn.Dense(
@@ -122,8 +147,10 @@ class CategoricalSeparateMLP(nn.Module):
         )(x_a)
         # pi = distrax.Categorical(logits=logits)
         pi = tfp.distributions.Categorical(logits=logits)
-        return v, pi
-
+        if self.algo == "dhvl-q":
+            return v, pi, q
+        else:
+            return v, pi
 
 class GaussianSeparateMLP(nn.Module):
     """Split Actor-Critic Architecture for PPO."""
@@ -160,6 +187,30 @@ class GaussianSeparateMLP(nn.Module):
             bias_init=default_mlp_init(),
         )(x_v)
 
+        # q_network
+        x_q = nn.relu(
+            nn.Dense(
+                self.num_hidden_units,
+                name= "critic_q_fc_1",
+                bias_init=default_mlp_init(),
+            )(x)
+        )
+        # Loop over rest of intermediate hidden layers
+        for i in range(1, self.num_hidden_layers):
+            x_q = nn.relu(
+                nn.Dense(
+                    self.num_hidden_units,
+                    name=f"critic_q_fc_{i + 1}",
+                    bias_init=default_mlp_init(),
+                )(x_q)
+            )
+        q = nn.Dense(
+            1,
+            name="critic_q_fc_q",
+            bias_init=default_mlp_init(),
+        )(x_q)
+
+
         x_a = nn.relu(
             nn.Dense(
                 self.num_hidden_units,
@@ -188,4 +239,4 @@ class GaussianSeparateMLP(nn.Module):
         )(x_a)
         scale = jax.nn.softplus(log_scale) + self.min_std
         pi = tfp.distributions.MultivariateNormalDiag(mu, scale)
-        return v, pi
+        return v, pi, q
